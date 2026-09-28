@@ -1,0 +1,11 @@
+# Built binary. Anchored to the repo root on purpose: a bare
+# `dockerfile-slim-advisor` would also match cmd/dockerfile-slim-advisor/ and
+# silently drop main.go from the commit.
+/dockerfile-slim-advisor
+/dist/
+
+*.test
+*.out
+
+# Fixtures are always tracked.
+!testdata/**
