@@ -1,8 +1,8 @@
 module github.com/moveeeax/dockerfile-slim-advisor
 
-go 1.26.3
+go 1.26.8
 
-require github.com/moby/buildkit v0.33.0
+require github.com/moby/buildkit v0.34.2
 
 require (
 	github.com/containerd/typeurl/v2 v2.3.0 // indirect
