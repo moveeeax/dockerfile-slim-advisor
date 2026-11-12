@@ -156,7 +156,7 @@ func TestShowSuppressed(t *testing.T) {
 		t.Fatal(err)
 	}
 	out := buf.String()
-	for _, want := range []string{"suppressed:", "DSA009  line 7", "by inline: tarball on purpose",
+	for _, want := range []string{"suppressed:", "DSA009  line 7", "by inline", "reason: tarball on purpose",
 		"by .slim-advisor.yaml", "no findings (2 suppressed)"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("text output missing %q:\n%s", want, out)

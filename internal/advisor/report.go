@@ -139,12 +139,20 @@ func (r Report) writeSuppressed(w io.Writer) error {
 		if f.Suppression == nil {
 			continue
 		}
-		note := "by " + f.Suppression.Source
-		if f.Suppression.Reason != "" {
-			note += ": " + f.Suppression.Reason
+		// The source is a path that can be longer than the wrap width, so
+		// it gets a line of its own and the reason wraps under it.
+		if _, err := fmt.Fprintf(w, "       by %s\n", f.Suppression.Source); err != nil {
+			return err
 		}
-		for _, line := range wrap(note, wrapWidth) {
-			if _, err := fmt.Fprintf(w, "       %s\n", line); err != nil {
+		if f.Suppression.Reason == "" {
+			continue
+		}
+		for i, line := range wrap("reason: "+f.Suppression.Reason, wrapWidth) {
+			prefix := "       "
+			if i > 0 {
+				prefix = "               "
+			}
+			if _, err := fmt.Fprintf(w, "%s%s\n", prefix, line); err != nil {
 				return err
 			}
 		}

@@ -230,7 +230,7 @@ func TestConfigNextToDockerfile(t *testing.T) {
 	}
 
 	out, _, _ = call(t, "", "--show-suppressed", path)
-	if !strings.Contains(out, "suppressed:") || !strings.Contains(out, "dev image") {
+	if !strings.Contains(out, "suppressed:") || !strings.Contains(out, "reason: dev image") {
 		t.Errorf("--show-suppressed should list them with the reason:\n%s", out)
 	}
 
