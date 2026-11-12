@@ -52,6 +52,10 @@ type Finding struct {
 	Title       string   `json:"title"`
 	Detail      string   `json:"detail"`
 	Fix         string   `json:"fix"`
+
+	// Suppression is set on findings accepted by an inline comment or the
+	// config file. Suppressed findings never affect the exit code.
+	Suppression *Suppression `json:"suppression,omitempty"`
 }
 
 // Options controls checks that need context beyond the Dockerfile text.
@@ -60,6 +64,8 @@ type Options struct {
 	// Dockerfile is read from stdin, where there is no directory to look in.
 	CheckDockerignore bool
 	HasDockerignore   bool
+	// Profile adds the hardened rule set when set to ProfileHardened.
+	Profile Profile
 }
 
 // Analyze runs every rule over a parsed Dockerfile and returns the findings
@@ -71,7 +77,30 @@ func Analyze(df *Dockerfile, opt Options) []Finding {
 	}
 	out = append(out, checkFinalStage(df)...)
 	out = append(out, checkDockerignore(df, opt)...)
+	if opt.Profile == ProfileHardened {
+		out = append(supersededByHardened(df, out), checkHardened(df)...)
+	}
+	return rank(out)
+}
 
+// supersededByHardened drops the default findings that a hardened rule
+// reports more strictly on the same line: DHB005 replaces DSA006, and DHB002
+// replaces DSA007 on the final FROM. Without this the same root user or
+// moving tag would be reported twice.
+func supersededByHardened(df *Dockerfile, fs []Finding) []Finding {
+	final := df.FinalStage()
+	out := fs[:0]
+	for _, f := range fs {
+		if f.ID == "DSA006" || (f.ID == "DSA007" && final != nil && f.Line == final.Line) {
+			continue
+		}
+		out = append(out, f)
+	}
+	return out
+}
+
+// rank orders findings by severity, then by line, and fills SeverityStr.
+func rank(out []Finding) []Finding {
 	sort.SliceStable(out, func(a, b int) bool {
 		if out[a].Severity != out[b].Severity {
 			return out[a].Severity > out[b].Severity

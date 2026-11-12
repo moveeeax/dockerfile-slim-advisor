@@ -109,3 +109,174 @@ func TestWrap(t *testing.T) {
 		t.Error("wrap of blank text should be nil")
 	}
 }
+
+func suppressedSample() []Finding {
+	return []Finding{
+		{ID: "DSA009", Severity: Low, SeverityStr: "low", Line: 7, Instruction: "ADD",
+			Title: "ADD used where COPY would do", Detail: "d", Fix: "f",
+			Suppression: &Suppression{Source: "inline", Reason: "tarball on purpose"}},
+		{ID: "DSA002", Severity: High, SeverityStr: "high", Line: 1, Instruction: "FROM",
+			Title: "final stage ships a build toolchain", Detail: "d", Fix: "f",
+			Suppression: &Suppression{Source: ".slim-advisor.yaml"}},
+	}
+}
+
+func TestSuppressedAreCountedNotListed(t *testing.T) {
+	r := sample()
+	r.SetSuppressed(suppressedSample(), false)
+	if r.Summary.Suppressed != 2 || r.Summary.Total != 2 {
+		t.Fatalf("summary = %+v", r.Summary)
+	}
+	var buf bytes.Buffer
+	if err := r.WriteText(&buf); err != nil {
+		t.Fatal(err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "2 findings: 1 high, 1 medium, 0 low, 2 suppressed") {
+		t.Errorf("summary line missing the suppressed count:\n%s", out)
+	}
+	if strings.Contains(out, "DSA009") {
+		t.Errorf("suppressed findings listed without --show-suppressed:\n%s", out)
+	}
+
+	buf.Reset()
+	if err := r.WriteJSON(&buf); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(buf.String(), `"suppressed": 2`) || strings.Contains(buf.String(), `"suppressed": [`) {
+		t.Errorf("json should count but not list suppressed findings:\n%s", buf.String())
+	}
+}
+
+func TestShowSuppressed(t *testing.T) {
+	r := NewReport("Dockerfile", nil)
+	r.SetSuppressed(suppressedSample(), true)
+	var buf bytes.Buffer
+	if err := r.WriteText(&buf); err != nil {
+		t.Fatal(err)
+	}
+	out := buf.String()
+	for _, want := range []string{"suppressed:", "DSA009  line 7", "by inline", "reason: tarball on purpose",
+		"by .slim-advisor.yaml", "no findings (2 suppressed)"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("text output missing %q:\n%s", want, out)
+		}
+	}
+
+	buf.Reset()
+	if err := r.WriteJSON(&buf); err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		Suppressed []struct {
+			ID          string `json:"id"`
+			Suppression struct {
+				Source string `json:"source"`
+				Reason string `json:"reason"`
+			} `json:"suppression"`
+		} `json:"suppressed"`
+	}
+	if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Suppressed) != 2 || got.Suppressed[0].Suppression.Reason != "tarball on purpose" {
+		t.Errorf("json suppressed = %+v", got.Suppressed)
+	}
+}
+
+func TestImageFindingHasNoLineColumn(t *testing.T) {
+	r := NewReport("ghcr.io/acme/api:1.0", []Finding{{ID: "DSI001", Severity: High, SeverityStr: "high",
+		Title: "image config sets no user", Detail: "d", Fix: "f"}})
+	var buf bytes.Buffer
+	if err := r.WriteText(&buf); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(buf.String(), "HIGH   DSI001            image config sets no user") {
+		t.Errorf("image finding should keep the title column aligned:\n%s", buf.String())
+	}
+}
+
+func TestWriteSARIF(t *testing.T) {
+	r := sample()
+	r.Path = "./build/Dockerfile"
+	r.SetSuppressed(suppressedSample(), false)
+	var buf bytes.Buffer
+	if err := r.WriteSARIF(&buf, "1.2.3"); err != nil {
+		t.Fatal(err)
+	}
+	var log struct {
+		Version string `json:"version"`
+		Runs    []struct {
+			Tool struct {
+				Driver struct {
+					Name    string `json:"name"`
+					Version string `json:"version"`
+					Rules   []struct {
+						ID string `json:"id"`
+					} `json:"rules"`
+				} `json:"driver"`
+			} `json:"tool"`
+			Results []struct {
+				RuleID    string `json:"ruleId"`
+				Level     string `json:"level"`
+				Locations []struct {
+					PhysicalLocation struct {
+						ArtifactLocation struct {
+							URI string `json:"uri"`
+						} `json:"artifactLocation"`
+						Region *struct {
+							StartLine int `json:"startLine"`
+						} `json:"region"`
+					} `json:"physicalLocation"`
+				} `json:"locations"`
+				Suppressions []struct {
+					Kind          string `json:"kind"`
+					Justification string `json:"justification"`
+				} `json:"suppressions"`
+			} `json:"results"`
+		} `json:"runs"`
+	}
+	if err := json.Unmarshal(buf.Bytes(), &log); err != nil {
+		t.Fatalf("invalid SARIF JSON: %v", err)
+	}
+	if log.Version != "2.1.0" || len(log.Runs) != 1 {
+		t.Fatalf("log = %+v", log)
+	}
+	run := log.Runs[0]
+	if run.Tool.Driver.Name != "dockerfile-slim-advisor" || run.Tool.Driver.Version != "1.2.3" || len(run.Tool.Driver.Rules) != len(RuleIDs()) {
+		t.Errorf("driver = %+v", run.Tool.Driver)
+	}
+	if len(run.Results) != 4 {
+		t.Fatalf("results = %d, want 2 open + 2 suppressed", len(run.Results))
+	}
+	first := run.Results[0]
+	if first.RuleID != "DSA001" || first.Level != "error" || first.Locations[0].PhysicalLocation.Region.StartLine != 3 ||
+		first.Locations[0].PhysicalLocation.ArtifactLocation.URI != "build/Dockerfile" || len(first.Suppressions) != 0 {
+		t.Errorf("first result = %+v", first)
+	}
+	if run.Results[1].Level != "warning" {
+		t.Errorf("medium should map to warning, got %q", run.Results[1].Level)
+	}
+	inline, external := run.Results[2], run.Results[3]
+	if inline.Level != "note" || len(inline.Suppressions) != 1 || inline.Suppressions[0].Kind != "inSource" ||
+		inline.Suppressions[0].Justification != "tarball on purpose" {
+		t.Errorf("inline suppressed result = %+v", inline)
+	}
+	if len(external.Suppressions) != 1 || external.Suppressions[0].Kind != "external" {
+		t.Errorf("config suppressed result = %+v", external)
+	}
+}
+
+func TestSARIFImageFindingHasNoRegion(t *testing.T) {
+	r := NewReport("ghcr.io/acme/api:1.0", []Finding{{ID: "DSI001", Severity: High, Title: "t", Detail: "d", Fix: "f"}})
+	var buf bytes.Buffer
+	if err := r.WriteSARIF(&buf, "dev"); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(buf.String(), "region") || !strings.Contains(buf.String(), `"uri": "ghcr.io/acme/api:1.0"`) {
+		t.Errorf("image results should carry the reference and no region:\n%s", buf.String())
+	}
+	if !strings.Contains(buf.String(), `"results": [`) {
+		t.Error("results must be an array")
+	}
+}

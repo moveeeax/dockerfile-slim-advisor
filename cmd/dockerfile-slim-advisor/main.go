@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"io"
@@ -16,6 +17,7 @@ import (
 var version = "dev"
 
 const usage = `dockerfile-slim-advisor [flags] <path>
+dockerfile-slim-advisor [flags] --image <ref|tarball>
 
   path    a Dockerfile, a directory containing one, or - for stdin
 
@@ -41,8 +43,13 @@ func (e exitCode) Error() string { return fmt.Sprintf("exit status %d", int(e)) 
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("dockerfile-slim-advisor", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	format := fs.String("format", "text", "output format: text or json")
+	format := fs.String("format", "text", "output format: text, json or sarif")
 	failOn := fs.String("fail-on", "high", "lowest severity that exits 1: high, medium, low or never")
+	profileFlag := fs.String("profile", "default", "rule set: default, or hardened for the DHB policy and no-shell image checks")
+	configPath := fs.String("config", "", "config file (default: .slim-advisor.yaml next to the Dockerfile, then in the current directory)")
+	showSuppressed := fs.Bool("show-suppressed", false, "list suppressed findings in text and json output")
+	imageRef := fs.String("image", "", "check a built image instead of a Dockerfile: a registry reference or a tarball written by docker save")
+	platform := fs.String("platform", "", "platform to pick from a multi-platform image, e.g. linux/arm64 (default linux/amd64)")
 	showVersion := fs.Bool("version", false, "print version and exit")
 	fs.Usage = func() {
 		fmt.Fprint(stderr, usage)
@@ -55,12 +62,23 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		fmt.Fprintln(stdout, version)
 		return nil
 	}
-	if fs.NArg() != 1 {
+	wantArgs := 1
+	if *imageRef != "" {
+		wantArgs = 0
+	}
+	if fs.NArg() != wantArgs {
 		fs.Usage()
 		return exitCode(2)
 	}
-	if *format != "text" && *format != "json" {
-		return fmt.Errorf("unknown format %q (want text or json)", *format)
+	if *platform != "" && *imageRef == "" {
+		return fmt.Errorf("--platform needs --image")
+	}
+	if *format != "text" && *format != "json" && *format != "sarif" {
+		return fmt.Errorf("unknown format %q (want text, json or sarif)", *format)
+	}
+	profile, err := advisor.ParseProfile(*profileFlag)
+	if err != nil {
+		return err
 	}
 
 	var threshold advisor.Severity
@@ -72,21 +90,58 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		threshold = s
 	}
 
-	path, opt, src, err := open(fs.Arg(0), stdin)
-	if err != nil {
-		return err
-	}
-	defer src.Close()
-
-	df, err := advisor.Parse(src, path)
-	if err != nil {
-		return err
-	}
-	report := advisor.NewReport(path, advisor.Analyze(df, opt))
-
-	if *format == "json" {
-		err = report.WriteJSON(stdout)
+	var (
+		path     string
+		df       *advisor.Dockerfile
+		findings []advisor.Finding
+		cfgDirs  []string
+	)
+	if *imageRef != "" {
+		path = *imageRef
+		img, err := advisor.OpenImage(context.Background(), *imageRef, *platform)
+		if err != nil {
+			return err
+		}
+		findings, err = advisor.AnalyzeImage(img, advisor.ImageOptions{Ref: *imageRef, Profile: profile})
+		if err != nil {
+			return err
+		}
+		cfgDirs = []string{"."}
 	} else {
+		var opt advisor.Options
+		var src io.ReadCloser
+		path, opt, src, err = open(fs.Arg(0), stdin)
+		if err != nil {
+			return err
+		}
+		defer src.Close()
+		opt.Profile = profile
+
+		df, err = advisor.Parse(src, path)
+		if err != nil {
+			return err
+		}
+		findings = advisor.Analyze(df, opt)
+		if path != "<stdin>" {
+			cfgDirs = append(cfgDirs, filepath.Dir(path))
+		}
+		cfgDirs = append(cfgDirs, ".")
+	}
+
+	cfg, err := loadConfig(*configPath, cfgDirs)
+	if err != nil {
+		return err
+	}
+	kept, suppressed := advisor.Suppress(df, cfg, findings)
+	report := advisor.NewReport(path, kept)
+	report.SetSuppressed(suppressed, *showSuppressed)
+
+	switch *format {
+	case "json":
+		err = report.WriteJSON(stdout)
+	case "sarif":
+		err = report.WriteSARIF(stdout, version)
+	default:
 		err = report.WriteText(stdout)
 	}
 	if err != nil {
@@ -98,6 +153,19 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		return exitCode(1)
 	}
 	return nil
+}
+
+// loadConfig reads --config when given, otherwise the first
+// .slim-advisor.yaml found in dirs. No config file is not an error.
+func loadConfig(explicit string, dirs []string) (*advisor.Config, error) {
+	p := explicit
+	if p == "" {
+		p = advisor.FindConfig(dirs...)
+	}
+	if p == "" {
+		return nil, nil
+	}
+	return advisor.LoadConfig(p)
 }
 
 // open resolves the argument to a reader. A directory argument is resolved to
