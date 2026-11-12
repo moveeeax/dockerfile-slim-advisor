@@ -18,6 +18,7 @@ type Instruction struct {
 	Flags    []string // instruction flags, e.g. "--from=builder"
 	Original string   // original source text, line continuations joined
 	Line     int
+	Comments []string // the comment block directly above, `#` stripped
 }
 
 // ArgText returns the arguments as one space-joined string, which is what
@@ -41,6 +42,7 @@ type Stage struct {
 	BaseImage    string // raw image reference as written
 	Name         string // lower-cased AS name, empty when unnamed
 	Line         int
+	Comments     []string // the comment block above the FROM
 	Instructions []Instruction
 }
 
@@ -97,13 +99,14 @@ func Parse(r io.Reader, path string) (*Dockerfile, error) {
 			Flags:    append([]string(nil), node.Flags...),
 			Original: node.Original,
 			Line:     node.StartLine,
+			Comments: append([]string(nil), node.PrevComment...),
 		}
 		for n := node.Next; n != nil; n = n.Next {
 			in.Args = append(in.Args, n.Value)
 		}
 
 		if in.Cmd == "FROM" {
-			stage := Stage{Index: len(df.Stages), Line: in.Line}
+			stage := Stage{Index: len(df.Stages), Line: in.Line, Comments: in.Comments}
 			if len(in.Args) > 0 {
 				stage.BaseImage = in.Args[0]
 			}

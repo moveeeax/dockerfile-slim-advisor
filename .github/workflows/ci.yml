@@ -60,3 +60,14 @@ jobs:
 
       - name: reads a Dockerfile from stdin
         run: cat examples/good.Dockerfile | ./dockerfile-slim-advisor -
+
+      - name: sarif output is valid
+        run: ./dockerfile-slim-advisor --format sarif --fail-on never examples/bad.Dockerfile | jq -e '.version == "2.1.0" and (.runs[0].results | length) > 0'
+
+      - name: hardened profile blocks the unpinned example
+        run: |
+          set +e
+          ./dockerfile-slim-advisor --profile hardened examples/good.Dockerfile
+          code=$?
+          set -e
+          test "$code" -eq 1

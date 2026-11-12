@@ -7,6 +7,10 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/google/go-containerregistry/pkg/name"
+	"github.com/google/go-containerregistry/pkg/v1/random"
+	"github.com/google/go-containerregistry/pkg/v1/tarball"
 )
 
 const badDockerfile = `FROM golang:1.22
@@ -194,5 +198,132 @@ func TestUnknownFormatAndMissingFile(t *testing.T) {
 	}
 	if err := run([]string{filepath.Join(t.TempDir(), "nope")}, strings.NewReader(""), &out, &errb); err == nil {
 		t.Error("missing file should be an error")
+	}
+}
+
+func TestHardenedProfile(t *testing.T) {
+	path := writeDockerfile(t, cleanDockerfile, true)
+	if _, _, code := call(t, "", path); code != 0 {
+		t.Fatalf("default profile exit = %d, want 0", code)
+	}
+	out, _, code := call(t, "", "--profile", "hardened", path)
+	if code != 1 || !strings.Contains(out, "DHB001") || !strings.Contains(out, "DHB007") {
+		t.Fatalf("hardened profile exit = %d, want 1 with DHB001 and DHB007:\n%s", code, out)
+	}
+	if _, errOut, code := call(t, "", "--profile", "strict", path); code != 2 || !strings.Contains(errOut, "unknown profile") {
+		t.Fatalf("bad profile: exit %d, stderr %q", code, errOut)
+	}
+}
+
+func TestConfigNextToDockerfile(t *testing.T) {
+	path := writeDockerfile(t, badDockerfile, true)
+	cfg := filepath.Join(filepath.Dir(path), ".slim-advisor.yaml")
+	if err := os.WriteFile(cfg, []byte("ignore:\n  - DSA001\n  - id: DSA002\n    reason: dev image\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, _, code := call(t, "", path)
+	if code != 0 {
+		t.Fatalf("with both high findings ignored exit = %d, want 0\n%s", code, out)
+	}
+	if !strings.Contains(out, "1 finding: 0 high, 1 medium, 0 low, 2 suppressed") {
+		t.Errorf("summary should count the suppressed findings:\n%s", out)
+	}
+
+	out, _, _ = call(t, "", "--show-suppressed", path)
+	if !strings.Contains(out, "suppressed:") || !strings.Contains(out, "dev image") {
+		t.Errorf("--show-suppressed should list them with the reason:\n%s", out)
+	}
+
+	// --config overrides discovery.
+	empty := filepath.Join(t.TempDir(), "other.yaml")
+	if err := os.WriteFile(empty, []byte("ignore: []\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, code := call(t, "", "--config", empty, path); code != 1 {
+		t.Errorf("--config with an empty list exit = %d, want 1", code)
+	}
+	if _, errOut, code := call(t, "", "--config", filepath.Join(t.TempDir(), "nope.yaml"), path); code != 2 || errOut == "" {
+		t.Errorf("missing --config: exit %d, stderr %q", code, errOut)
+	}
+}
+
+func TestBadConfigIsAnError(t *testing.T) {
+	path := writeDockerfile(t, badDockerfile, true)
+	cfg := filepath.Join(filepath.Dir(path), ".slim-advisor.yaml")
+	if err := os.WriteFile(cfg, []byte("ignore: [DSA01]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, errOut, code := call(t, "", path); code != 2 || !strings.Contains(errOut, "unknown rule") {
+		t.Fatalf("exit = %d, stderr %q", code, errOut)
+	}
+}
+
+func TestInlineSuppressionFromCLI(t *testing.T) {
+	body := "# slim-advisor ignore=DSA002 reason=\"dev image\"\n" + badDockerfile
+	out, _, code := call(t, "", "--format", "json", writeDockerfile(t, body, true))
+	if code != 1 {
+		t.Fatalf("DSA001 is still open, exit = %d", code)
+	}
+	var report struct {
+		Summary struct {
+			Suppressed int `json:"suppressed"`
+		} `json:"summary"`
+	}
+	if err := json.Unmarshal([]byte(out), &report); err != nil || report.Summary.Suppressed != 1 {
+		t.Fatalf("summary.suppressed = %d, err %v\n%s", report.Summary.Suppressed, err, out)
+	}
+}
+
+func TestSARIFFormat(t *testing.T) {
+	out, _, code := call(t, "", "--format", "sarif", writeDockerfile(t, badDockerfile, true))
+	if code != 1 {
+		t.Fatalf("exit = %d, want 1", code)
+	}
+	var log struct {
+		Version string `json:"version"`
+		Runs    []struct {
+			Results []struct {
+				RuleID string `json:"ruleId"`
+			} `json:"results"`
+		} `json:"runs"`
+	}
+	if err := json.Unmarshal([]byte(out), &log); err != nil {
+		t.Fatalf("invalid SARIF: %v", err)
+	}
+	if log.Version != "2.1.0" || len(log.Runs) != 1 || len(log.Runs[0].Results) == 0 {
+		t.Fatalf("sarif = %+v", log)
+	}
+}
+
+func TestImageTarball(t *testing.T) {
+	img, err := random.Image(256, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "image.tar")
+	tag, _ := name.NewTag("example.com/app:1.0")
+	if err := tarball.WriteToFile(path, tag, img); err != nil {
+		t.Fatal(err)
+	}
+	// A random image has no user and no entrypoint.
+	out, _, code := call(t, "", "--image", path)
+	if code != 1 || !strings.Contains(out, "DSI001") {
+		t.Fatalf("exit = %d, want 1 with DSI001:\n%s", code, out)
+	}
+	if !strings.HasPrefix(out, path) {
+		t.Errorf("report should be labelled with the image: %q", strings.SplitN(out, "\n", 2)[0])
+	}
+}
+
+func TestImageUsageErrors(t *testing.T) {
+	path := writeDockerfile(t, cleanDockerfile, true)
+	if _, _, code := call(t, "", "--image", "example.com/app:1.0", path); code != 2 {
+		t.Errorf("--image with a Dockerfile argument should exit 2, got %d", code)
+	}
+	if _, errOut, code := call(t, "", "--platform", "linux/arm64", path); code != 2 || !strings.Contains(errOut, "--image") {
+		t.Errorf("--platform without --image: exit %d, stderr %q", code, errOut)
+	}
+	if _, errOut, code := call(t, "", "--image", "Not A Ref"); code != 2 || errOut == "" {
+		t.Errorf("invalid reference: exit %d, stderr %q", code, errOut)
 	}
 }
